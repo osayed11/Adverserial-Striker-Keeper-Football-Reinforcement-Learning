@@ -1,0 +1,16 @@
+{
+  "name": "com.unity.ml-agents",
+  "displayName": "ML Agents",
+  "version": "4.0.2",
+  "unity": "6000.0",
+  "description": "Use state-of-the-art machine learning to create intelligent character behaviors in any Unity environment (games, robotics, film, etc.).",
+  "dependencies": {
+    "com.unity.ai.inference": "2.5.0",
+    "com.unity.modules.imageconversion": "1.0.0",
+    "com.unity.modules.jsonserialize": "1.0.0",
+    "com.unity.modules.physics": "1.0.0"
+  },
+  "relatedPackages": {
+    "com.unity.ml-agents.tests": "1.0.0"
+  }
+}
