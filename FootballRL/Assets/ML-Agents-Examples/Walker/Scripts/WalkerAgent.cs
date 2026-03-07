@@ -450,6 +450,7 @@ public class WalkerAgent : Agent
         }
         else
         {
+            reward += -2.0f;
             Debug.Log($"[GK {reason}] Wrong way/No dive. Reward: {reward}");
         }
         

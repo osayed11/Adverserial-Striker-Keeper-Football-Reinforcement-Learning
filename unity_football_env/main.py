@@ -22,6 +22,7 @@ from train_striker import StrikerActorCritic, BEHAVIOR_NAME as STRIKER_BEHAVIOR
 from train_striker import LR as STRIKER_LR, BUFFER_SIZE as STRIKER_BUFFER, BATCH_SIZE as STRIKER_BATCH
 from train_goalkeeper import GoalkeeperActorCritic, BEHAVIOR_NAME as GK_BEHAVIOR
 from train_goalkeeper import LR as GK_LR, BUFFER_SIZE as GK_BUFFER, BATCH_SIZE as GK_BATCH
+from train_goalkeeper import ENTROPY_COEFF as GK_ENTROPY_COEFF
 
 # ========================
 # SHARED HYPERPARAMETERS
@@ -29,7 +30,7 @@ from train_goalkeeper import LR as GK_LR, BUFFER_SIZE as GK_BUFFER, BATCH_SIZE a
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPSILON = 0.2
-ENTROPY_COEFF = 0.02
+ENTROPY_COEFF = 0.02   # Default (used for striker)
 VALUE_COEFF = 0.5
 NUM_EPOCHS = 3
 MAX_EPISODES = 100000
@@ -118,7 +119,7 @@ def compute_gae(rewards, values, dones, next_value, gamma=GAMMA, lam=GAE_LAMBDA)
 # ========================
 # PPO UPDATE
 # ========================
-def ppo_update(model, optimizer, buffer, next_value, batch_size):
+def ppo_update(model, optimizer, buffer, next_value, batch_size, entropy_coeff=ENTROPY_COEFF):
     """
     Perform PPO clipped objective update.
     
@@ -160,7 +161,7 @@ def ppo_update(model, optimizer, buffer, next_value, batch_size):
         surr2 = torch.clamp(ratio, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages_t
         policy_loss = -torch.min(surr1, surr2).mean()
         value_loss = F.mse_loss(new_value, returns_t)
-        loss = policy_loss + VALUE_COEFF * value_loss - ENTROPY_COEFF * entropy.mean()
+        loss = policy_loss + VALUE_COEFF * value_loss - entropy_coeff * entropy.mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -171,7 +172,9 @@ def ppo_update(model, optimizer, buffer, next_value, batch_size):
 # ========================
 class AgentRunner:
     """Wraps a model + buffer + optimizer for one agent."""
-    def __init__(self, name, model, lr, buffer_size, batch_size, writer_tag):
+    def __init__(self, name, model, lr, buffer_size, batch_size, writer_tag,
+                 entropy_coeff=ENTROPY_COEFF, one_shot=False,
+                 kick_obs_indices=None, kick_speed_threshold=0.1):
         self.name = name
         self.model = model
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -179,7 +182,14 @@ class AgentRunner:
         self.buffer_size = buffer_size
         self.batch_size = batch_size
         self.writer_tag = writer_tag
+        self.entropy_coeff = entropy_coeff
         self.episode_reward = 0.0
+        # One-shot decision mode: only buffer the single meaningful decision per episode
+        # Used for agents like the GK that make one irreversible action per episode
+        self.one_shot = one_shot
+        self.kick_obs_indices = kick_obs_indices  # (start, end) indices of ball velocity in obs
+        self.kick_speed_threshold = kick_speed_threshold
+        self._decision_data = None  # Captured (obs, action, log_prob, value) at decision time
 
 
 # ========================
@@ -244,7 +254,11 @@ def main():
         lr=GK_LR,
         buffer_size=GK_BUFFER,
         batch_size=GK_BATCH,
-        writer_tag="goalkeeper"
+        writer_tag="goalkeeper",
+        entropy_coeff=GK_ENTROPY_COEFF,
+        one_shot=True,
+        kick_obs_indices=(3, 6),  # Ball velocity = obs[3:6] in GK observation
+        kick_speed_threshold=0.1  # Matches C# kickDetectionSpeed
     )
     
     agents = [striker, goalkeeper]
@@ -290,6 +304,7 @@ def main():
             env.reset()
             for agent in agents:
                 agent.episode_reward = 0.0
+                agent._decision_data = None  # Reset one-shot decision tracking
             done = False
             ep_steps = 0
             
@@ -346,13 +361,40 @@ def main():
                     # Store experience
                     obs, action_np, lp, rew, val = agent_data[agent.name]
                     
-                    if not args.inference:
-                        agent.buffer.store(obs, action_np, lp, rew, is_done, val)
-                    
-                    # Handle terminal reward safely
+                    # If this is a terminal step, use the terminal reward instead of the
+                    # decision step reward. The terminal reward contains the actual
+                    # episode outcome (e.g. GK dive correctness: +2/-2/-5).
                     if is_done:
                         term_reward = terminal_steps.reward[0]
+                        rew = rew + term_reward  # Add terminal reward to this transition
                         agent.episode_reward += term_reward
+                    
+                    if not args.inference:
+                        if agent.one_shot:
+                            # ONE-SHOT AGENT (e.g. GK): only buffer the actual decision step.
+                            # The GK makes ONE meaningful action per episode (when ball is kicked).
+                            # All other actions are ignored by C#. Buffering them would cause PPO
+                            # to waste gradient updates on meaningless actions and drown out the
+                            # real decision signal.
+                            if agent.kick_obs_indices is not None:
+                                i_start, i_end = agent.kick_obs_indices
+                                ball_vel = obs[i_start:i_end]
+                                ball_speed = float(np.linalg.norm(ball_vel))
+                                # Capture decision data at the moment the ball is first kicked
+                                if ball_speed > agent.kick_speed_threshold and agent._decision_data is None:
+                                    agent._decision_data = (obs.copy(), action_np.copy(), lp, val)
+                            
+                            # On terminal step, commit the decision to buffer with total episode reward
+                            if is_done and agent._decision_data is not None:
+                                d_obs, d_act, d_lp, d_val = agent._decision_data
+                                agent.buffer.store(d_obs, d_act, d_lp, agent.episode_reward, True, d_val)
+                                agent._decision_data = None
+                        else:
+                            # Normal multi-step agent: buffer every transition
+                            agent.buffer.store(obs, action_np, lp, rew, is_done, val)
+                    
+                    # Handle terminal cleanup
+                    if is_done:
                         agent_data[agent.name] = None # Prevent pulling this agent again this episode
                     
                     # Training Update
@@ -366,7 +408,7 @@ def main():
                         else:
                             next_val = 0.0
                         
-                        ppo_update(agent.model, agent.optimizer, agent.buffer, next_val, agent.batch_size)
+                        ppo_update(agent.model, agent.optimizer, agent.buffer, next_val, agent.batch_size, agent.entropy_coeff)
                         agent.buffer.clear()
                         print(f"  [{agent.writer_tag} PPO update at step {total_steps}]")
                 
@@ -378,6 +420,10 @@ def main():
             # Logging
             for agent in agents:
                 writer.add_scalar(f"{agent.writer_tag}/episode_reward", agent.episode_reward, episode)
+            
+            # Log GK action std to monitor exploration health
+            gk_std = goalkeeper.model.actor_log_std.exp().item()
+            writer.add_scalar("goalkeeper/action_std", gk_std, episode)
                 
             striker_rewards.append(striker.episode_reward)
             gk_rewards.append(goalkeeper.episode_reward)

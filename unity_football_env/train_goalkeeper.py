@@ -14,8 +14,10 @@ BEHAVIOR_NAME = "Goalkeeper"  # Will match "Goalkeeper?team=0"
 LR = 3e-4
 HIDDEN_SIZE = 128      # Reverted for simpler observation processing
 NUM_LAYERS = 2
-BUFFER_SIZE = 4096
-BATCH_SIZE = 512
+BUFFER_SIZE = 128     # One entry per episode (one-shot agent), so updates every ~128 episodes
+BATCH_SIZE = 32
+ENTROPY_COEFF = 0.15   # Higher entropy to prevent policy collapse (single decision per episode)
+MIN_LOG_STD = -1.0     # Floor on log_std — prevents std from collapsing below ~0.37
 
 
 # ========================
@@ -54,7 +56,8 @@ class GoalkeeperActorCritic(nn.Module):
         shared_out = self.forward(obs)
         
         action_mean = self.actor_mean(shared_out)
-        action_std = self.actor_log_std.exp()
+        clamped_log_std = torch.clamp(self.actor_log_std, min=MIN_LOG_STD)
+        action_std = clamped_log_std.exp()
         dist = Normal(action_mean, action_std)
         
         action = dist.sample()
@@ -78,7 +81,8 @@ class GoalkeeperActorCritic(nn.Module):
         shared_out = self.forward(obs)
         
         action_mean = self.actor_mean(shared_out)
-        action_std = self.actor_log_std.exp()
+        clamped_log_std = torch.clamp(self.actor_log_std, min=MIN_LOG_STD)
+        action_std = clamped_log_std.exp()
         dist = Normal(action_mean, action_std)
         
         log_prob = dist.log_prob(actions).sum(axis=-1)
