@@ -55,4 +55,6 @@ ENV/
 
 # ML-Agents
 runs/
-# checkpoints/  <-- Keep this if you want to include pretrained models, otherwise uncomment
+# Ignore intermediate checkpoints but keep final models
+unity_football_env/checkpoints/striker/ep*.pt
+unity_football_env/checkpoints/goalkeeper/ep*.pt
